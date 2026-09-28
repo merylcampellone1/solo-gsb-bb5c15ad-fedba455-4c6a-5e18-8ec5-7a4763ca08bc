@@ -7,7 +7,7 @@ from fastapi import FastAPI
 
 from .config import Settings, get_settings
 from .db import make_engine, make_session_factory
-from .routers import balances, reconcile, webhooks
+from .routers import balances, reconcile, refund_audit, webhooks
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -37,6 +37,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(webhooks.router)
     app.include_router(balances.router)
+    app.include_router(refund_audit.router)
     app.include_router(reconcile.router)
 
     @app.get("/healthz", tags=["meta"])

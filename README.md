@@ -122,6 +122,63 @@ headers = {"X-Webhook-Timestamp": ts, "X-Webhook-Signature": f"sha256={sig}"}
 
 差异类型：`missing_in_ledger`（上游有、账本无）、`missing_in_source`（账本有、上游无）、`amount_mismatch` / `type_mismatch`（同 ID 字段不一致）、`balance_mismatch`（窗口净额与期望不符）。`expected_balance`、`expected_events` 均可选。
 
+### 4. 退款审计 `GET /accounts/{account_id}/refund-audit?as_of=...`
+
+按业务时间截取账本（`occurred_at <= as_of`，**含 as_of 当天**），通过 `reference_event_id` 将退款归集到原收入，输出每笔收入的已退 / 剩余金额以及无法归因的退款异常。
+
+- **乱序自愈**：同一收入的多笔退款按 `(occurred_at, event_id)` 顺序累计已退金额。退款先于原收入（补录）到达时，在较早的切片里是 `reference_not_found` 异常；原收入补录后，在包含两者的切片里自动转为已归因。
+- **异常分类**（每笔退款至多一类）：
+
+  | kind | 触发条件 |
+  |---|---|
+  | `missing_reference` | 退款没有 `reference_event_id` |
+  | `reference_not_found` | 引用的事件在 `as_of` 切片中不存在（可能只是尚未补录） |
+  | `cross_account_or_currency` | 引用的事件属于其他账户，或币种与退款不一致 |
+  | `reference_not_income` | 引用的事件本身是退款而非收入 |
+  | `over_refund` | 使该收入的累计退款超过原收入金额；**整笔不抵扣**收入剩余额（不做部分抵扣） |
+
+- 结果按收入 ID 升序输出 `incomes`，异常按事件 ID 升序输出 `anomalies`；金额沿用整数分计算，以十进制字符串返回。`as_of` 必填，缺失或格式非法 → `422`。
+
+请求示例：
+
+```bash
+curl "http://localhost:8000/accounts/acct-1/refund-audit?as_of=2026-09-20T23:59:59Z"
+```
+
+响应示例：
+
+```json
+{
+  "account_id": "acct-1",
+  "as_of": "2026-09-20T23:59:59Z",
+  "incomes": [
+    {
+      "income_event_id": "evt_001",
+      "currency": "USD",
+      "amount": "100.00",
+      "refunded_amount": "30.00",
+      "remaining_amount": "70.00",
+      "refund_event_ids": ["evt_002"]
+    }
+  ],
+  "anomalies": [
+    {
+      "kind": "over_refund",
+      "event_id": "evt_003",
+      "reference_event_id": "evt_001",
+      "currency": "USD",
+      "amount": "80.00",
+      "detail": "refund of 80.00 would raise cumulative refunds on 'evt_001' to 110.00, exceeding the income of 100.00; the whole refund is not attributed",
+      "income_event_id": "evt_001",
+      "income_amount": "100.00",
+      "cumulative_amount": "110.00"
+    }
+  ]
+}
+```
+
+注意：`over_refund` 退款整笔不抵扣，所以上例中 `remaining_amount` 仍是 `70.00`，而不是 `20.00`；`reference_not_found` 在收入补录后的切片中会自动消失。
+
 ## 设计要点
 
 - **追加式事件日志 + 余额投影**：`events` 表是不可变事实源；`account_balances` 是增量维护的物化投影，两者可互相校验（`recompute=true` 全量折叠）。
@@ -139,7 +196,7 @@ app/
   schemas.py     Pydantic 请求/响应模型
   security.py    HMAC 签名验证
   services.py    幂等入账、余额折叠、对账核心逻辑
-  routers/       webhooks / balances / reconcile 路由
+  routers/       webhooks / balances / refund_audit / reconcile 路由
   main.py        应用工厂
 tests/test_api.py
 Dockerfile  docker-compose.yml  requirements.txt

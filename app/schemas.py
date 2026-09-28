@@ -128,6 +128,44 @@ class Discrepancy(BaseModel):
     expected_value: str | None = None
 
 
+class RefundAuditIncome(BaseModel):
+    income_event_id: str
+    currency: str
+    amount: str
+    # Sum of refunds attributed to this income (integer cents internally).
+    refunded_amount: str
+    remaining_amount: str
+    # Attributed refunds in (occurred_at, event_id) accumulation order.
+    refund_event_ids: list[str]
+
+
+class RefundAuditAnomaly(BaseModel):
+    kind: Literal[
+        "missing_reference",        # refund carries no reference_event_id
+        "reference_not_found",      # referenced event absent from the as_of slice
+        "cross_account_or_currency",  # referenced event is another account/currency
+        "reference_not_income",     # referenced event exists but is not an income
+        "over_refund",              # cumulative refunds would exceed the income
+    ]
+    event_id: str
+    reference_event_id: str | None
+    currency: str
+    amount: str
+    detail: str
+    # Populated when the referenced event was found (e.g. over_refund).
+    income_event_id: str | None = None
+    income_amount: str | None = None
+    # Attempted cumulative refunded amount (including this refund).
+    cumulative_amount: str | None = None
+
+
+class RefundAuditResponse(BaseModel):
+    account_id: str
+    as_of: datetime
+    incomes: list[RefundAuditIncome]
+    anomalies: list[RefundAuditAnomaly]
+
+
 class ReconcileResponse(BaseModel):
     account_id: str
     window: dict[str, datetime]

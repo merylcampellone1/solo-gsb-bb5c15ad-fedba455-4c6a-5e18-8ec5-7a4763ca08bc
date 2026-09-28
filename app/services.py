@@ -5,6 +5,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from fastapi import HTTPException
 from sqlalchemy import select
@@ -169,6 +170,178 @@ def events_in_window(session: Session, account_id: str, start: datetime, end: da
             .order_by(Event.occurred_at, Event.id)
         )
     )
+
+
+# ---------------------------------------------------------------- refund audit
+
+
+def refund_audit(session: Session, account_id: str, as_of: datetime) -> dict[str, Any]:
+    """Attribute refunds to the income they reference within the as_of slice.
+
+    The ledger is sliced by business time: only events with ``occurred_at <=
+    as_of`` are visible. Refunds are grouped to their referenced income via
+    ``reference_event_id`` and accumulated in (occurred_at, event_id) order.
+    Because the view is recomputed from the whole slice each time, a refund
+    that arrives before its income is backfilled automatically becomes
+    attributed once the income exists in a later slice.
+
+    Refunds that cannot be attributed are returned as anomalies:
+
+    * ``missing_reference``        -- no reference_event_id
+    * ``reference_not_found``      -- referenced event absent from the slice
+    * ``cross_account_or_currency``-- referenced event belongs to another
+                                      account or uses another currency
+    * ``reference_not_income``     -- referenced event is itself a refund
+    * ``over_refund``              -- the refund would make the cumulative
+                                      attributed amount exceed the income;
+                                      the whole refund is rejected and does
+                                      not offset the income's remainder
+    """
+    # Load the whole as_of slice, across every account, so cross-account
+    # references can be distinguished from genuinely missing ones.
+    sliced = list(
+        session.scalars(
+            select(Event)
+            .where(Event.occurred_at <= as_of)
+            .order_by(Event.occurred_at, Event.event_id)
+        )
+    )
+    by_id: dict[str, Event] = {e.event_id: e for e in sliced}
+
+    incomes = sorted(
+        (e for e in sliced if e.account_id == account_id and e.type == "income"),
+        key=lambda e: e.event_id,
+    )
+    # Refunds for this account accumulate in business-time order; event_id
+    # breaks ties deterministically.
+    refunds = sorted(
+        (e for e in sliced if e.account_id == account_id and e.type == "refund"),
+        key=lambda e: (e.occurred_at, e.event_id),
+    )
+
+    def anomaly(
+        refund: Event,
+        kind: str,
+        detail: str,
+        *,
+        income: Event | None = None,
+        cumulative_minor: int | None = None,
+    ) -> dict[str, Any]:
+        entry: dict[str, Any] = {
+            "kind": kind,
+            "event_id": refund.event_id,
+            "reference_event_id": refund.reference_event_id,
+            "currency": refund.currency,
+            "amount": to_decimal_str(refund.amount_minor),
+            "detail": detail,
+            "income_event_id": None,
+            "income_amount": None,
+            "cumulative_amount": None,
+        }
+        if income is not None:
+            entry["income_event_id"] = income.event_id
+            entry["income_amount"] = to_decimal_str(income.amount_minor)
+        if cumulative_minor is not None:
+            entry["cumulative_amount"] = to_decimal_str(cumulative_minor)
+        return entry
+
+    # Running attributed total per income event_id, in accumulation order.
+    refunded: dict[str, int] = {e.event_id: 0 for e in incomes}
+    attributed: dict[str, list[str]] = {e.event_id: [] for e in incomes}
+    anomalies: list[dict[str, Any]] = []
+
+    for refund in refunds:
+        ref = refund.reference_event_id
+        if ref is None:
+            anomalies.append(
+                anomaly(refund, "missing_reference", "refund has no reference_event_id")
+            )
+            continue
+
+        target = by_id.get(ref)
+        if target is None:
+            anomalies.append(
+                anomaly(
+                    refund,
+                    "reference_not_found",
+                    f"reference_event_id {ref!r} does not exist in the as_of slice",
+                )
+            )
+            continue
+        if target.account_id != account_id:
+            anomalies.append(
+                anomaly(
+                    refund,
+                    "cross_account_or_currency",
+                    f"referenced event {ref!r} belongs to another account "
+                    f"({target.account_id!r})",
+                )
+            )
+            continue
+        if target.currency != refund.currency:
+            anomalies.append(
+                anomaly(
+                    refund,
+                    "cross_account_or_currency",
+                    f"refund currency {refund.currency!r} does not match referenced "
+                    f"income currency {target.currency!r}",
+                )
+            )
+            continue
+        if target.type != "income":
+            anomalies.append(
+                anomaly(
+                    refund,
+                    "reference_not_income",
+                    f"referenced event {ref!r} is a {target.type}, not an income",
+                    income=target,
+                )
+            )
+            continue
+
+        cumulative = refunded[ref] + refund.amount_minor
+        if cumulative > target.amount_minor:
+            # The whole refund is rejected: it is not attributed and does not
+            # offset the income's remaining amount at all.
+            anomalies.append(
+                anomaly(
+                    refund,
+                    "over_refund",
+                    (
+                        f"refund of {to_decimal_str(refund.amount_minor)} would raise "
+                        f"cumulative refunds on {ref!r} to "
+                        f"{to_decimal_str(cumulative)}, exceeding the income of "
+                        f"{to_decimal_str(target.amount_minor)}; the whole refund is "
+                        f"not attributed"
+                    ),
+                    income=target,
+                    cumulative_minor=cumulative,
+                )
+            )
+            continue
+
+        refunded[ref] = cumulative
+        attributed[ref].append(refund.event_id)
+
+    income_rows = [
+        {
+            "income_event_id": e.event_id,
+            "currency": e.currency,
+            "amount": to_decimal_str(e.amount_minor),
+            "refunded_amount": to_decimal_str(refunded[e.event_id]),
+            "remaining_amount": to_decimal_str(e.amount_minor - refunded[e.event_id]),
+            "refund_event_ids": attributed[e.event_id],
+        }
+        for e in incomes
+    ]
+    anomalies.sort(key=lambda a: a["event_id"])
+
+    return {
+        "account_id": account_id,
+        "as_of": as_of,
+        "incomes": income_rows,
+        "anomalies": anomalies,
+    }
 
 
 def reconcile(session: Session, req: ReconcileRequest) -> dict:
