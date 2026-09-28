@@ -264,3 +264,251 @@ def test_invalid_event_type_rejected(client):
 
 def test_healthz(client):
     assert client.get("/healthz").json() == {"status": "ok"}
+
+
+# -------------------------------------------------------------- refund audit
+
+
+def audit(client, account="acct-1", as_of="2026-09-30T23:59:59Z"):
+    resp = client.get(f"/accounts/{account}/refund-audit", params={"as_of": as_of})
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def test_refund_audit_attributes_refund_to_income(client):
+    post_event(client, make_event("inc-1", amount="100.00", occurred_at="2026-09-01T10:00:00Z"))
+    post_event(client, make_event(
+        "ref-1", type_="refund", amount="30.00", occurred_at="2026-09-01T12:00:00Z",
+        reference_event_id="inc-1"))
+
+    data = audit(client)
+    assert data["account_id"] == "acct-1"
+    assert len(data["incomes"]) == 1
+    row = data["incomes"][0]
+    assert row["income_event_id"] == "inc-1"
+    assert row["amount"] == "100.00"
+    assert row["refunded_amount"] == "30.00"
+    assert row["remaining_amount"] == "70.00"
+    assert row["refunds"] == [{
+        "event_id": "ref-1", "amount": "30.00",
+        "occurred_at": "2026-09-01T12:00:00",
+    }]
+    assert data["anomalies"] == []
+
+
+def test_refund_audit_earlier_refund_attributed_after_income_backfill(client):
+    # Refund is delivered (and has a later occurred_at) *before* the income is
+    # recorded; on replay both are in the slice, so it must be attributed.
+    post_event(client, make_event(
+        "ref-early", type_="refund", amount="30.00",
+        occurred_at="2026-09-01T12:00:00Z", reference_event_id="inc-late"))
+    post_event(client, make_event("inc-late", amount="100.00",
+                                  occurred_at="2026-09-01T10:00:00Z"))
+
+    data = audit(client)
+    assert data["anomalies"] == []
+    row = data["incomes"][0]
+    assert row["refunded_amount"] == "30.00"
+    assert row["remaining_amount"] == "70.00"
+
+
+def test_refund_audit_multiple_refunds_accumulate_in_order(client):
+    post_event(client, make_event("inc-1", amount="100.00", occurred_at="2026-09-01T10:00:00Z"))
+    # Events posted out of arrival order; ordering must follow business time.
+    post_event(client, make_event("ref-c", type_="refund", amount="20.00",
+                                  occurred_at="2026-09-01T14:00:00Z", reference_event_id="inc-1"))
+    post_event(client, make_event("ref-b", type_="refund", amount="0.05",
+                                  occurred_at="2026-09-01T12:00:00Z", reference_event_id="inc-1"))
+    post_event(client, make_event("ref-a", type_="refund", amount="10.00",
+                                  occurred_at="2026-09-01T11:00:00Z", reference_event_id="inc-1"))
+
+    row = audit(client)["incomes"][0]
+    assert [r["event_id"] for r in row["refunds"]] == ["ref-a", "ref-b", "ref-c"]
+    assert row["refunded_amount"] == "30.05"
+    assert row["remaining_amount"] == "69.95"
+
+
+def test_refund_audit_same_timestamp_tie_breaks_on_event_id(client):
+    post_event(client, make_event("inc-1", amount="100.00", occurred_at="2026-09-01T10:00:00Z"))
+    ts = "2026-09-01T12:00:00Z"
+    post_event(client, make_event("r2", type_="refund", amount="60.00",
+                                  occurred_at=ts, reference_event_id="inc-1"))
+    post_event(client, make_event("r1", type_="refund", amount="60.00",
+                                  occurred_at=ts, reference_event_id="inc-1"))
+
+    data = audit(client)
+    row = data["incomes"][0]
+    # r1 first: fits (60 <= 100). r2 next: 60 + 60 > 100 -> rejected wholesale.
+    assert [r["event_id"] for r in row["refunds"]] == ["r1"]
+    assert row["refunded_amount"] == "60.00"
+    assert row["remaining_amount"] == "40.00"
+    anomalies = data["anomalies"]
+    assert len(anomalies) == 1
+    assert anomalies[0]["event_id"] == "r2"
+    assert anomalies[0]["kind"] == "refund_exceeds_income"
+    assert anomalies[0]["amount"] == "60.00"
+
+
+def test_refund_audit_excess_refund_does_not_block_later_small_refund(client):
+    post_event(client, make_event("inc-1", amount="100.00", occurred_at="2026-09-01T10:00:00Z"))
+    post_event(client, make_event("big", type_="refund", amount="150.00",
+                                  occurred_at="2026-09-01T11:00:00Z", reference_event_id="inc-1"))
+    post_event(client, make_event("small", type_="refund", amount="25.00",
+                                  occurred_at="2026-09-01T12:00:00Z", reference_event_id="inc-1"))
+
+    data = audit(client)
+    row = data["incomes"][0]
+    assert [r["event_id"] for r in row["refunds"]] == ["small"]
+    assert row["refunded_amount"] == "25.00"
+    assert row["remaining_amount"] == "75.00"
+    assert [a["event_id"] for a in data["anomalies"]] == ["big"]
+    assert data["anomalies"][0]["kind"] == "refund_exceeds_income"
+
+
+def test_refund_audit_exact_total_is_not_excess(client):
+    post_event(client, make_event("inc-1", amount="100.00", occurred_at="2026-09-01T10:00:00Z"))
+    post_event(client, make_event("r1", type_="refund", amount="100.00",
+                                  occurred_at="2026-09-01T11:00:00Z", reference_event_id="inc-1"))
+
+    data = audit(client)
+    row = data["incomes"][0]
+    assert row["refunded_amount"] == "100.00"
+    assert row["remaining_amount"] == "0.00"
+    assert data["anomalies"] == []
+
+
+def test_refund_audit_anomaly_missing_reference(client):
+    post_event(client, make_event("inc-1", amount="100.00", occurred_at="2026-09-01T10:00:00Z"))
+    post_event(client, make_event("r1", type_="refund", amount="10.00",
+                                  occurred_at="2026-09-01T11:00:00Z"))
+
+    data = audit(client)
+    assert data["incomes"][0]["refunded_amount"] == "0.00"
+    assert len(data["anomalies"]) == 1
+    a = data["anomalies"][0]
+    assert a["event_id"] == "r1"
+    assert a["kind"] == "reference_missing"
+    assert a["reference_event_id"] is None
+
+
+def test_refund_audit_anomaly_reference_not_found(client):
+    post_event(client, make_event("r1", type_="refund", amount="10.00",
+                                  occurred_at="2026-09-01T11:00:00Z",
+                                  reference_event_id="ghost"))
+
+    a = audit(client)["anomalies"][0]
+    assert a["event_id"] == "r1"
+    assert a["kind"] == "reference_not_found"
+    assert a["reference_event_id"] == "ghost"
+
+
+def test_refund_audit_income_recorded_after_cutoff_is_not_found(client):
+    post_event(client, make_event("inc-1", amount="100.00", occurred_at="2026-09-05T10:00:00Z"))
+    post_event(client, make_event("r1", type_="refund", amount="10.00",
+                                  occurred_at="2026-09-01T11:00:00Z",
+                                  reference_event_id="inc-1"))
+
+    # Before the income's business time: reference absent from the slice.
+    data = audit(client, as_of="2026-09-02T00:00:00Z")
+    assert data["incomes"] == []
+    assert [a["kind"] for a in data["anomalies"]] == ["reference_not_found"]
+
+    # After: the same refund is automatically attributed.
+    data = audit(client, as_of="2026-09-06T00:00:00Z")
+    assert data["anomalies"] == []
+    assert data["incomes"][0]["refunded_amount"] == "10.00"
+
+
+def test_refund_audit_anomaly_cross_account_reference(client):
+    post_event(client, make_event("inc-a", account_id="acct-a", amount="100.00",
+                                  occurred_at="2026-09-01T10:00:00Z"))
+    post_event(client, make_event("r-cross", account_id="acct-b", type_="refund",
+                                  amount="10.00", occurred_at="2026-09-01T11:00:00Z",
+                                  reference_event_id="inc-a"))
+
+    data = audit(client, account="acct-b")
+    assert data["incomes"] == []
+    a = data["anomalies"][0]
+    assert a["event_id"] == "r-cross"
+    assert a["kind"] == "reference_account_mismatch"
+
+
+def test_refund_audit_anomaly_currency_mismatch(client):
+    post_event(client, make_event("inc-1", amount="100.00", currency="USD",
+                                  occurred_at="2026-09-01T10:00:00Z"))
+    post_event(client, make_event("r-eur", type_="refund", amount="10.00", currency="EUR",
+                                  occurred_at="2026-09-01T11:00:00Z",
+                                  reference_event_id="inc-1"))
+
+    a = audit(client)["anomalies"][0]
+    assert a["event_id"] == "r-eur"
+    assert a["kind"] == "reference_currency_mismatch"
+    # The income's USD totals stay untouched.
+    usd = next(i for i in audit(client)["incomes"] if i["currency"] == "USD")
+    assert usd["refunded_amount"] == "0.00"
+
+
+def test_refund_audit_anomaly_reference_not_income(client):
+    post_event(client, make_event("ref-base", type_="refund", amount="10.00",
+                                  occurred_at="2026-09-01T10:00:00Z"))
+    post_event(client, make_event("r-ref", type_="refund", amount="5.00",
+                                  occurred_at="2026-09-01T11:00:00Z",
+                                  reference_event_id="ref-base"))
+
+    anomalies = audit(client)["anomalies"]
+    kinds = {a["event_id"]: a["kind"] for a in anomalies}
+    assert kinds["ref-base"] == "reference_missing"
+    assert kinds["r-ref"] == "reference_not_income"
+
+
+def test_refund_audit_as_of_is_inclusive(client):
+    post_event(client, make_event("inc-1", amount="100.00", occurred_at="2026-09-01T10:00:00Z"))
+    post_event(client, make_event("r1", type_="refund", amount="10.00",
+                                  occurred_at="2026-09-01T12:00:00Z",
+                                  reference_event_id="inc-1"))
+
+    data = audit(client, as_of="2026-09-01T12:00:00Z")
+    assert data["incomes"][0]["refunded_amount"] == "10.00"
+
+    # One second earlier the refund is excluded (income present, no refunds).
+    data = audit(client, as_of="2026-09-01T11:59:59Z")
+    assert data["incomes"][0]["refunded_amount"] == "0.00"
+    assert data["anomalies"] == []
+
+    # Before the income too: empty ledger for the account.
+    data = audit(client, as_of="2026-09-01T09:00:00Z")
+    assert data["incomes"] == []
+
+
+def test_refund_audit_output_is_stably_sorted(client):
+    post_event(client, make_event("inc-z", amount="100.00", occurred_at="2026-09-01T10:00:00Z"))
+    post_event(client, make_event("inc-a", amount="50.00", occurred_at="2026-09-01T09:00:00Z"))
+    post_event(client, make_event("an-z", type_="refund", amount="1.00",
+                                  occurred_at="2026-09-01T13:00:00Z"))
+    post_event(client, make_event("an-a", type_="refund", amount="1.00",
+                                  occurred_at="2026-09-01T12:00:00Z"))
+
+    data = audit(client)
+    assert [i["income_event_id"] for i in data["incomes"]] == ["inc-a", "inc-z"]
+    assert [a["event_id"] for a in data["anomalies"]] == ["an-a", "an-z"]
+
+
+def test_refund_audit_multiple_incomes_are_isolated(client):
+    post_event(client, make_event("inc-1", amount="100.00", occurred_at="2026-09-01T10:00:00Z"))
+    post_event(client, make_event("inc-2", amount="200.00", occurred_at="2026-09-02T10:00:00Z"))
+    post_event(client, make_event("r1", type_="refund", amount="10.00",
+                                  occurred_at="2026-09-02T12:00:00Z",
+                                  reference_event_id="inc-1"))
+    post_event(client, make_event("r2", type_="refund", amount="50.00",
+                                  occurred_at="2026-09-03T12:00:00Z",
+                                  reference_event_id="inc-2"))
+
+    by_id = {i["income_event_id"]: i for i in audit(client)["incomes"]}
+    assert by_id["inc-1"]["remaining_amount"] == "90.00"
+    assert by_id["inc-2"]["remaining_amount"] == "150.00"
+
+
+def test_refund_audit_requires_as_of(client):
+    resp = client.get("/accounts/acct-1/refund-audit")
+    assert resp.status_code == 422
+

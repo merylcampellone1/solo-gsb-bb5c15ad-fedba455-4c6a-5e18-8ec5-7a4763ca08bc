@@ -122,6 +122,54 @@ headers = {"X-Webhook-Timestamp": ts, "X-Webhook-Signature": f"sha256={sig}"}
 
 差异类型：`missing_in_ledger`（上游有、账本无）、`missing_in_source`（账本有、上游无）、`amount_mismatch` / `type_mismatch`（同 ID 字段不一致）、`balance_mismatch`（窗口净额与期望不符）。`expected_balance`、`expected_events` 均可选。
 
+### 4. 退款审计 `GET /accounts/{account_id}/refund-audit?as_of=2026-09-10T23:59:59Z`
+
+按业务时间截取账本（只回放 `occurred_at <= as_of` 的事件，含 `as_of` 时刻），将退款通过 `reference_event_id` 归集到原收入，输出"每笔收入已退 / 剩余"视图以及无法归因的异常退款。
+
+```bash
+curl "http://localhost:8000/accounts/acct-1/refund-audit?as_of=2026-09-10T23:59:59Z"
+```
+
+```json
+{
+  "account_id": "acct-1",
+  "as_of": "2026-09-10T23:59:59",
+  "incomes": [
+    {
+      "income_event_id": "evt_001",
+      "currency": "USD",
+      "amount": "100.00",
+      "occurred_at": "2026-09-01T10:00:00",
+      "refunded_amount": "30.00",
+      "remaining_amount": "70.00",
+      "refunds": [
+        {"event_id": "evt_002", "amount": "30.00",
+         "occurred_at": "2026-09-02T09:00:00"}
+      ]
+    }
+  ],
+  "anomalies": [
+    {"event_id": "evt_009", "currency": "USD", "amount": "80.00",
+     "occurred_at": "2026-09-03T09:00:00", "reference_event_id": "evt_001",
+     "kind": "refund_exceeds_income", "detail": "..."}
+  ]
+}
+```
+
+规则：
+
+- **乱序 / 补录自愈**：同一收入的多笔退款按 `(occurred_at, event_id)` 顺序累计；审计是对 as-of 切片的纯回放，因此退款先于收入到达时，只要原收入在切片内（例如后续补录），先到的退款会**自动转为已归因**，不产生异常。
+- **异常类型**（一笔退款至多一种）：
+  - `reference_missing`：退款没有 `reference_event_id`；
+  - `reference_not_found`：引用的事件在 as-of 账本中不存在（ID 未知，或在截止时间之后才发生 / 入账）；
+  - `reference_account_mismatch`：引用事件属于其他账户；
+  - `reference_currency_mismatch`：退款币种与原收入不一致；
+  - `reference_not_income`：引用的事件本身是退款而非收入；
+  - `refund_exceeds_income`：应用该退款会使该收入的累计已退超过原收入金额——**整笔不抵扣**收入剩余额（后续更小的退款仍可正常抵扣）。
+- **排序**：`incomes` 按收入事件 ID、`anomalies` 按异常退款事件 ID 升序，回放结果稳定。
+- 金额全程以整数分计算，输出为十进制字符串（如 `"70.00"`）。
+
+
 ## 设计要点
 
 - **追加式事件日志 + 余额投影**：`events` 表是不可变事实源；`account_balances` 是增量维护的物化投影，两者可互相校验（`recompute=true` 全量折叠）。
@@ -139,7 +187,7 @@ app/
   schemas.py     Pydantic 请求/响应模型
   security.py    HMAC 签名验证
   services.py    幂等入账、余额折叠、对账核心逻辑
-  routers/       webhooks / balances / reconcile 路由
+  routers/       webhooks / balances / reconcile / refund-audit 路由
   main.py        应用工厂
 tests/test_api.py
 Dockerfile  docker-compose.yml  requirements.txt

@@ -135,3 +135,49 @@ class ReconcileResponse(BaseModel):
     ledger_net: dict[str, str]
     discrepancies: list[Discrepancy]
     in_sync: bool
+
+
+class AttributedRefund(BaseModel):
+    """A refund successfully attributed to its original income."""
+
+    event_id: str
+    amount: str
+    occurred_at: datetime
+
+
+class IncomeRefundAudit(BaseModel):
+    """One income plus the refunds attributed to it within the as-of cut."""
+
+    income_event_id: str
+    currency: str
+    amount: str
+    occurred_at: datetime
+    refunded_amount: str
+    remaining_amount: str
+    refunds: list[AttributedRefund]
+
+
+class RefundAnomaly(BaseModel):
+    """A refund that could not be attributed to a valid original income."""
+
+    event_id: str
+    currency: str
+    amount: str
+    occurred_at: datetime
+    reference_event_id: str | None
+    kind: Literal[
+        "reference_missing",
+        "reference_not_found",
+        "reference_account_mismatch",
+        "reference_currency_mismatch",
+        "reference_not_income",
+        "refund_exceeds_income",
+    ]
+    detail: str
+
+
+class RefundAuditResponse(BaseModel):
+    account_id: str
+    as_of: datetime
+    incomes: list[IncomeRefundAudit]
+    anomalies: list[RefundAnomaly]

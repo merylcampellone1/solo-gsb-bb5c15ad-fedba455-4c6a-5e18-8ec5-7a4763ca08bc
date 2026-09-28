@@ -244,3 +244,150 @@ def reconcile(session: Session, req: ReconcileRequest) -> dict:
         "discrepancies": discrepancies,
         "in_sync": not discrepancies,
     }
+
+
+def refund_audit(session: Session, account_id: str, as_of: datetime) -> dict:
+    """Attribute refunds to their original incomes within the ledger as of
+    ``as_of`` (inclusive, by business ``occurred_at``).
+
+    Refunds are grouped onto the income named by ``reference_event_id`` and,
+    for each income, applied in (occurred_at, event_id) order. Because this is
+    a pure replay over the as-of slice, a refund that arrived before its
+    income was backfilled is attributed automatically once the income is
+    present.
+
+    Refunds that cannot be attributed are reported as anomalies:
+
+    * reference_missing           -- no reference_event_id at all;
+    * reference_not_found         -- referenced event is absent from the
+                                     as-of ledger (unknown id or not yet
+                                     recorded by the cut-off);
+    * reference_account_mismatch  -- referenced event belongs to another
+                                     account;
+    * reference_currency_mismatch-- different currency;
+    * reference_not_income        -- referenced event is itself a refund;
+    * refund_exceeds_income       -- applying the refund would push the
+                                     cumulative refunded total above the
+                                     original income. Such a refund does not
+                                     reduce the income's remaining amount at
+                                     all (the whole amount is rejected).
+
+    Incomes are sorted by income event id and anomalies by their refund event
+    id, so output is stable across replay.
+    """
+    events = list(
+        session.scalars(
+            select(Event)
+            .where(
+                Event.account_id == account_id,
+                Event.occurred_at <= as_of,
+            )
+            .order_by(Event.occurred_at, Event.event_id)
+        )
+    )
+
+    # Global index (across accounts) of events within the cut, so a reference
+    # to an event on another account can be diagnosed precisely.
+    all_events = list(session.scalars(select(Event).where(Event.occurred_at <= as_of)))
+    events_by_id = {e.event_id: e for e in all_events}
+
+    incomes = [e for e in events if e.type == "income"]
+    refunds_by_ref: dict[str, list[Event]] = {}
+    anomalies: list[dict] = []
+
+    def add_anomaly(e: Event, kind: str, detail: str) -> None:
+        anomalies.append(
+            {
+                "event_id": e.event_id,
+                "currency": e.currency,
+                "amount": to_decimal_str(e.amount_minor),
+                "occurred_at": e.occurred_at,
+                "reference_event_id": e.reference_event_id,
+                "kind": kind,
+                "detail": detail,
+            }
+        )
+
+    for e in events:
+        if e.type != "refund":
+            continue
+        ref = e.reference_event_id
+        if ref is None:
+            add_anomaly(e, "reference_missing", "refund has no reference_event_id")
+        elif ref not in events_by_id:
+            add_anomaly(
+                e,
+                "reference_not_found",
+                f"reference_event_id {ref!r} does not exist in the ledger as of the cut-off",
+            )
+        else:
+            target = events_by_id[ref]
+            if target.account_id != account_id:
+                add_anomaly(
+                    e,
+                    "reference_account_mismatch",
+                    f"referenced event {ref!r} belongs to account {target.account_id!r}, "
+                    f"not {account_id!r}",
+                )
+            elif target.currency != e.currency:
+                add_anomaly(
+                    e,
+                    "reference_currency_mismatch",
+                    f"refund currency {e.currency!r} differs from referenced income "
+                    f"currency {target.currency!r}",
+                )
+            elif target.type != "income":
+                add_anomaly(
+                    e,
+                    "reference_not_income",
+                    f"referenced event {ref!r} is a {target.type}, not an income",
+                )
+            else:
+                refunds_by_ref.setdefault(ref, []).append(e)
+
+    income_rows: list[dict] = []
+    for income in incomes:
+        refunded = 0
+        attributed: list[dict] = []
+        for r in refunds_by_ref.get(income.event_id, []):
+            if refunded + r.amount_minor > income.amount_minor:
+                # Whole refund is rejected: it does not touch the remaining
+                # amount, and later smaller refunds can still be applied.
+                add_anomaly(
+                    r,
+                    "refund_exceeds_income",
+                    f"refund of {to_decimal_str(r.amount_minor)} would make cumulative refunds "
+                    f"({to_decimal_str(refunded + r.amount_minor)}) exceed income "
+                    f"{to_decimal_str(income.amount_minor)}",
+                )
+                continue
+            refunded += r.amount_minor
+            attributed.append(
+                {
+                    "event_id": r.event_id,
+                    "amount": to_decimal_str(r.amount_minor),
+                    "occurred_at": r.occurred_at,
+                }
+            )
+
+        income_rows.append(
+            {
+                "income_event_id": income.event_id,
+                "currency": income.currency,
+                "amount": to_decimal_str(income.amount_minor),
+                "occurred_at": income.occurred_at,
+                "refunded_amount": to_decimal_str(refunded),
+                "remaining_amount": to_decimal_str(income.amount_minor - refunded),
+                "refunds": attributed,
+            }
+        )
+
+    income_rows.sort(key=lambda row: row["income_event_id"])
+    anomalies.sort(key=lambda row: row["event_id"])
+
+    return {
+        "account_id": account_id,
+        "as_of": as_of,
+        "incomes": income_rows,
+        "anomalies": anomalies,
+    }
